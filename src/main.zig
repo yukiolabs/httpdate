@@ -173,37 +173,40 @@ pub const SystemTime = struct {
     const is_posix = switch (builtin.os.tag) {
         .wasi => builtin.link_libc,
         .windows => false,
-        .macos, .ios, .tvos, .watchos => false,
-        else => builtin.os.tag != .darwin,
+        else => true,
     };
 
     pub fn now() error{Unsupported}!SystemTime {
-        switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos => {
-                var v: os.timeval = undefined;
-                os.gettimeofday(&v, null);
-                return SystemTime{
-                    .timestamp = @intCast(u64, v.tv_sec),
-                };
-            },
-            .linux => {
-                var ts: os.timespec = undefined;
-                os.clock_gettime(os.CLOCK.CLOCK_REALTIME, &ts) catch return error.Unsupported;
-            },
-            else => return error.Unsupported,
+        if (builtin.os.tag == .windows) {
+            const kernel32 = struct {
+                extern "kernel32" fn GetSystemTimePreciseAsFileTime(
+                    lpFileTime: *os.windows.FILETIME,
+                ) callconv(os.windows.WINAPI) void;
+            };
+
+            var ft: os.windows.FILETIME = undefined;
+            kernel32.GetSystemTimePreciseAsFileTime(&ft);
+            const ft64 = (@as(u64, ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+
+            // FileTime is in units of 100 nanoseconds
+            // and uses the NTFS/Windows epoch of 1601-01-01 instead of Unix Epoch 1970-01-01.
+            const epoch_adjust = std.time.epoch.windows * (std.time.ns_per_s / 100);
+            return SystemTime{ .timestamp = @bitCast(u64, (@bitCast(i64, ft64) + epoch_adjust) * 100) };
         }
+        if (builtin.os.tag == .wasi and !builtin.link_libc) {
+            var ns: os.wasi.timestamp_t = undefined;
+            const rc = os.wasi.clock_time_get(os.wasi.CLOCK.CLOCK_REALTIME, 1, &ns);
+            if (rc != .SUCCESS) return error.Unsupported;
+            return SystemTime{ .timestamp = ns };
+        }
+        var ts: os.timespec = undefined;
+        os.clock_gettime(os.CLOCK.CLOCK_REALTIME, &ts) catch return error.Unsupported;
+        return SystemTime{ .timestamp = ts };
     }
 
     fn seconds(self: SystemTime) u64 {
-        switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos => {
-                return self.timestamp;
-            },
-            .linux => {
-                return @intCast(u64, self.timestamp.tv_sec);
-            },
-            else => unreachable,
-        }
+        if (!is_posix) return self.timestamp;
+        return @intCast(u64, self.timestamp.tv_sec);
     }
 
     pub fn from(v: HTTPDate) SystemTime {
@@ -234,15 +237,14 @@ pub const SystemTime = struct {
     }
 
     pub fn from_seconds(ts: u64) SystemTime {
-        return switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos => {
-                return SystemTime{ .timestamp = ts };
-            },
-            .linux => {
-                return SystemTime{ .timestamp = .{ .tv_sec = @intCast(os.time_t, ts) } };
-            },
-            else => unreachable,
-        };
+        if (!is_posix) return SystemTime{ .timestamp = ts };
+        return SystemTime{ .timestamp = .{
+            .tv_nsec = 0,
+            .tv_sec = @bitCast(
+                isize,
+                @truncate(usize, ts),
+            ),
+        } };
     }
 };
 
